@@ -13,6 +13,20 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
+// buildObfuscatedSessionInit wraps a 10-byte core payload in the obfuscated
+// wire format expected by handleSessionInitRequest.  Uses a fixed XOR key so
+// that the resulting payload size is deterministic (xorKey[3]=0xDD → pad=0).
+func buildObfuscatedSessionInit(core []byte) []byte {
+	xorKey := [sessionInitXORKeySize]byte{0xAA, 0xBB, 0xCC, 0xDD}
+	padLen := int(xorKey[3]) % (sessionInitMaxPadding + 1) // 0xDD%13 == 0
+	payload := make([]byte, sessionInitMinWireSize+padLen)
+	copy(payload[0:sessionInitXORKeySize], xorKey[:])
+	for i := 0; i < sessionInitCoreSize; i++ {
+		payload[sessionInitXORKeySize+i] = core[i] ^ xorKey[i%sessionInitXORKeySize]
+	}
+	return payload
+}
+
 func TestSessionInitPolicyMTULimitsAreAppliedToServerSession(t *testing.T) {
 	store := newSessionStore(16, 32)
 	payload := make([]byte, sessionInitDataSize)
@@ -90,17 +104,17 @@ func TestHandleSessionInitRequestIncludesServerClientPolicy(t *testing.T) {
 	}
 
 	verifyCode := [4]byte{1, 2, 3, 4}
-	initPayload := make([]byte, sessionInitDataSize)
-	initPayload[0] = mtuProbeModeRaw
-	initPayload[1] = compression.PackPair(compression.TypeOff, compression.TypeOff)
-	binary.BigEndian.PutUint16(initPayload[2:4], 220)
-	binary.BigEndian.PutUint16(initPayload[4:6], 5000)
-	copy(initPayload[6:10], verifyCode[:])
+	core := make([]byte, sessionInitCoreSize)
+	core[0] = mtuProbeModeRaw
+	core[1] = compression.PackPair(compression.TypeOff, compression.TypeOff)
+	binary.BigEndian.PutUint16(core[2:4], 220)
+	binary.BigEndian.PutUint16(core[4:6], 5000)
+	copy(core[6:10], verifyCode[:])
 
 	response := s.handleSessionInitRequest(query, domainMatcher.Decision{RequestName: "x.v.example.com"}, VpnProto.Packet{
 		SessionID:  0,
 		PacketType: Enums.PACKET_SESSION_INIT,
-		Payload:    initPayload,
+		Payload:    buildObfuscatedSessionInit(core),
 	})
 	if response == nil {
 		t.Fatal("expected session accept response")

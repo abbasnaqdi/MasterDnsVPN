@@ -30,10 +30,52 @@ var ErrSessionTableFull = errors.New("session table full")
 const (
 	maxServerSessionID    = 255
 	maxServerSessionSlots = 255
-	sessionInitDataSize   = 10
-	minSessionMTU         = 10
-	maxSessionMTU         = 4096
+
+	// sessionInitCoreSize is the size of the de-obfuscated core SESSION_INIT payload.
+	// It matches the layout used by findOrCreate and the Signature key.
+	sessionInitCoreSize = 10
+
+	// Kept so that existing direct-core tests compile without change.
+	sessionInitDataSize = sessionInitCoreSize
+
+	// Obfuscation wire format constants (must mirror client values):
+	//   bytes[0..3]  = random XOR key
+	//   bytes[4..13] = core XOR-encrypted with cycling key
+	//   bytes[14..]  = (xorKey[3] % 13) random tail bytes
+	sessionInitXORKeySize  = 4
+	sessionInitMinWireSize = sessionInitCoreSize + sessionInitXORKeySize // 14
+	sessionInitMaxPadding  = 12
+	sessionInitMaxWireSize = sessionInitMinWireSize + sessionInitMaxPadding // 26
+
+	minSessionMTU = 10
+	maxSessionMTU = 4096
 )
+
+// deobfuscateSessionInit validates and de-obfuscates a SESSION_INIT wire payload.
+//
+// Wire format produced by the client (variable 14-26 bytes):
+//
+//	bytes[0..3]  : 4-byte random XOR key
+//	bytes[4..13] : 10-byte core XOR-encrypted with cycling key
+//	bytes[14..]  : (xorKey[3] % 13) random tail bytes (ignored after validation)
+//
+// Returns the 10-byte core on success, nil if the payload is malformed.
+func deobfuscateSessionInit(payload []byte) (core []byte, ok bool) {
+	if len(payload) < sessionInitMinWireSize || len(payload) > sessionInitMaxWireSize {
+		return nil, false
+	}
+	// Validate that the tail length is consistent with the XOR key.
+	expectedPad := int(payload[3]) % (sessionInitMaxPadding + 1)
+	if len(payload) != sessionInitMinWireSize+expectedPad {
+		return nil, false
+	}
+	// De-XOR the core.
+	core = make([]byte, sessionInitCoreSize)
+	for i := 0; i < sessionInitCoreSize; i++ {
+		core[i] = payload[sessionInitXORKeySize+i] ^ payload[i%sessionInitXORKeySize]
+	}
+	return core, true
+}
 
 type sessionRecord struct {
 	mu sync.RWMutex

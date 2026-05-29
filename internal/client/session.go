@@ -31,7 +31,20 @@ var (
 )
 
 const (
-	sessionInitPayloadSize      = 10
+	// sessionInitCoreSize is the size of the unobfuscated 10-byte core payload.
+	sessionInitCoreSize = 10
+	// Kept for backwards compatibility with existing tests that use it directly.
+	sessionInitPayloadSize = sessionInitCoreSize
+
+	// Obfuscation constants: each SESSION_INIT carries a 4-byte random XOR key
+	// prepended to the XOR-encrypted core, plus a variable-length random tail.
+	// tail_len = xorKey[3] % (sessionInitMaxPadding+1)  →  0..12 bytes
+	// Total payload size: 14..26 bytes (variable each attempt).
+	sessionInitXORKeySize = 4
+	sessionInitMinPayload = sessionInitCoreSize + sessionInitXORKeySize // 14
+	sessionInitMaxPadding = 12
+	sessionInitMaxPayload = sessionInitMinPayload + sessionInitMaxPadding // 26
+
 	sessionAcceptPayloadSize    = VpnProto.SessionAcceptPayloadSize
 	sessionBusyPayloadSize      = 4
 	sessionCloseBurstMaxTargets = 10
@@ -59,7 +72,7 @@ func (c *Client) InitializeSession(maxAttempts int) error {
 }
 
 func (c *Client) initializeSessionRequest() error {
-	conn, initPayload, verifyCode, err := c.nextSessionInitAttempt()
+	conn, initPayload, responseMode, verifyCode, err := c.nextSessionInitAttempt()
 	if err != nil {
 		return err
 	}
@@ -112,7 +125,7 @@ waitPhase:
 		case res := <-resChan:
 			responsesReceived++
 			if res.err == nil {
-				if err := c.applySessionInitPacket(res.packet, initPayload, verifyCode); err == nil {
+				if err := c.applySessionInitPacket(res.packet, responseMode, verifyCode); err == nil {
 					cancel()
 					return nil
 				} else if errors.Is(err, ErrSessionInitBusy) {
@@ -136,7 +149,7 @@ waitPhase:
 	}
 }
 
-func (c *Client) applySessionInitPacket(packet VpnProto.Packet, initPayload []byte, verifyCode [4]byte) error {
+func (c *Client) applySessionInitPacket(packet VpnProto.Packet, responseMode uint8, verifyCode [4]byte) error {
 	if c.SessionReady() {
 		return nil
 	}
@@ -163,7 +176,7 @@ func (c *Client) applySessionInitPacket(packet VpnProto.Packet, initPayload []by
 
 		c.sessionID = sessionAccept.SessionID
 		c.sessionCookie = sessionAccept.SessionCookie
-		c.responseMode = initPayload[0]
+		c.responseMode = responseMode
 		c.uploadCompression, c.downloadCompression = compression.SplitPair(sessionAccept.CompressionPair)
 		if sessionAccept.HasClientPolicySync {
 			c.applySessionClientPolicy(sessionAccept.ClientPolicy)
@@ -349,29 +362,97 @@ func formatPolicyFloat(value float64) string {
 	return fmt.Sprintf("%.3f", value)
 }
 
+// buildSessionInitPayload builds an obfuscated SESSION_INIT payload.
+//
+// Wire format (variable 14-26 bytes):
+//
+//	bytes [0..3]  : 4-byte random XOR key
+//	bytes [4..13] : 10-byte core XOR-encrypted with the cycling key
+//	bytes [14..]  : N random padding bytes, 0 ≤ N ≤ min(12, syncedUploadMTU-18)
+//
+// The padding length is derived from xorKey[3] so the server can reconstruct it
+// deterministically without an extra length field.
+//
+// Padding is capped by the upload MTU so the total raw VPN packet
+// (4-byte SESSION_INIT header + this payload) never exceeds syncedUploadMTU.
+//
+// Core layout (10 bytes, recovered after XOR):
+//
+//	byte  0      : response mode flag
+//	byte  1      : compression pair
+//	bytes 2-3    : upload MTU (big-endian uint16)
+//	bytes 4-5    : download MTU (big-endian uint16)
+//	bytes 6-9    : verify code (4 random bytes)
 func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, error) {
 	var verifyCode [4]byte
+
+	// Generate 4-byte random XOR key.
+	xorKey, err := randomBytes(sessionInitXORKeySize)
+	if err != nil {
+		return nil, false, verifyCode, err
+	}
+
+	// Generate verifyCode.
 	randomPart, err := randomBytes(len(verifyCode))
 	if err != nil {
 		return nil, false, verifyCode, err
 	}
 	copy(verifyCode[:], randomPart)
 
-	payload := make([]byte, sessionInitPayloadSize)
+	// Build the 10-byte unobfuscated core.
+	var core [sessionInitCoreSize]byte
 	if c.cfg.BaseEncodeData {
-		payload[0] = mtuProbeBase64Reply
+		core[0] = mtuProbeBase64Reply
 	}
-	payload[1] = compression.PackPair(c.uploadCompression, c.downloadCompression)
-	binary.BigEndian.PutUint16(payload[2:4], uint16(c.syncedUploadMTU))
-	binary.BigEndian.PutUint16(payload[4:6], uint16(c.syncedDownloadMTU))
-	copy(payload[6:10], verifyCode[:])
-	return payload, payload[0] == mtuProbeBase64Reply, verifyCode, nil
+
+	core[1] = compression.PackPair(c.uploadCompression, c.downloadCompression)
+	binary.BigEndian.PutUint16(core[2:4], uint16(c.syncedUploadMTU))
+	binary.BigEndian.PutUint16(core[4:6], uint16(c.syncedDownloadMTU))
+	copy(core[6:10], verifyCode[:])
+
+	// Compute the maximum allowed padding based on upload MTU.
+	// Total raw packet = SESSION_INIT header (4 bytes) + payload.
+	// Payload = sessionInitMinPayload (14) + padLen.
+	// Therefore: padLen ≤ syncedUploadMTU - 4 - 14 = syncedUploadMTU - 18.
+	sessionInitHeaderSize := VpnProto.HeaderRawSize(Enums.PACKET_SESSION_INIT) // always 4
+	maxAllowedPayload := c.syncedUploadMTU - sessionInitHeaderSize
+	maxPad := maxAllowedPayload - sessionInitMinPayload
+	if maxPad > sessionInitMaxPadding {
+		maxPad = sessionInitMaxPadding
+	}
+
+	if maxPad < 0 {
+		maxPad = 0
+	}
+
+	// Derive tail-padding length from xorKey[3] so the server can reconstruct it.
+	padLen := int(xorKey[3]) % (maxPad + 1)
+
+	// Assemble final payload: [xorKey | xored_core | random_tail]
+	payload := make([]byte, sessionInitMinPayload+padLen)
+	copy(payload[0:sessionInitXORKeySize], xorKey)
+	for i := 0; i < sessionInitCoreSize; i++ {
+		payload[sessionInitXORKeySize+i] = core[i] ^ xorKey[i%sessionInitXORKeySize]
+	}
+	if padLen > 0 {
+		tailBytes, err := randomBytes(padLen)
+		if err != nil {
+			return nil, false, verifyCode, err
+		}
+		copy(payload[sessionInitMinPayload:], tailBytes)
+	}
+
+	isBase64 := core[0] == mtuProbeBase64Reply
+	return payload, isBase64, verifyCode, nil
 }
 
-func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
+// nextSessionInitAttempt returns the cached (or freshly built) obfuscated
+// SESSION_INIT payload together with the plain responseMode byte and the
+// verifyCode that the client will use to authenticate the server's reply.
+func (c *Client) nextSessionInitAttempt() (Connection, []byte, uint8, [4]byte, error) {
 	var empty [4]byte
 	if c == nil {
-		return Connection{}, nil, empty, ErrSessionInitFailed
+		return Connection{}, nil, 0, empty, ErrSessionInitFailed
 	}
 
 	c.initStateMu.Lock()
@@ -381,7 +462,7 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 	if !c.sessionInitReady {
 		payload, responseBase64, verifyCode, err := c.buildSessionInitPayload()
 		if err != nil {
-			return Connection{}, nil, empty, err
+			return Connection{}, nil, 0, empty, err
 		}
 		c.sessionInitPayload = payload
 		c.sessionInitBase64 = responseBase64
@@ -392,7 +473,13 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 
 	active := c.balancer.ActiveConnections()
 	if len(active) == 0 {
-		return Connection{}, nil, empty, ErrNoValidConnections
+		return Connection{}, nil, 0, empty, ErrNoValidConnections
+	}
+
+	// Derive the plain responseMode from the cached base64 flag.
+	respMode := uint8(0)
+	if c.sessionInitBase64 {
+		respMode = mtuProbeBase64Reply
 	}
 
 	// Use the cursor to rotate between valid resolvers in a Round-Robin fashion.
@@ -406,10 +493,10 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 		}
 
 		c.sessionInitCursor = (idxInValid + 1) % validLen
-		return conn, c.sessionInitPayload, c.sessionInitVerify, nil
+		return conn, c.sessionInitPayload, respMode, c.sessionInitVerify, nil
 	}
 
-	return Connection{}, nil, empty, ErrNoValidConnections
+	return Connection{}, nil, 0, empty, ErrNoValidConnections
 }
 
 func (c *Client) resetSessionInitState() {

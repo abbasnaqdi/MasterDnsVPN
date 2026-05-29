@@ -682,22 +682,29 @@ func buildPreSessionPacketTypes() [256]bool {
 }
 
 func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domainMatcher.Decision, vpnPacket VpnProto.Packet) []byte {
-	if vpnPacket.SessionID != 0 || len(vpnPacket.Payload) != sessionInitDataSize {
+	if vpnPacket.SessionID != 0 {
 		return nil
 	}
 
-	requestedUpload, requestedDownload := compression.SplitPair(vpnPacket.Payload[1])
+	// De-obfuscate the wire payload to recover the 10-byte core.
+	core, ok := deobfuscateSessionInit(vpnPacket.Payload)
+	if !ok {
+		return nil
+	}
+
+	requestedUpload, requestedDownload := compression.SplitPair(core[1])
 	resolvedUpload := resolveCompressionType(requestedUpload, s.uploadCompressionMask)
 	resolvedDownload := resolveCompressionType(requestedDownload, s.downloadCompressionMask)
 
 	record, reused, err := s.sessions.findOrCreate(
-		vpnPacket.Payload,
+		core,
 		resolvedUpload,
 		resolvedDownload,
 		s.cfg.EffectiveMaxPacketsPerBatch(),
 		s.cfg.ClientMaxUploadMTU,
 		s.cfg.ClientMaxDownloadMTU,
 	)
+
 	if err != nil {
 		if err == ErrSessionTableFull {
 			if s.log != nil {
@@ -706,13 +713,16 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 					decision.RequestName,
 				)
 			}
-			return s.buildSessionBusyResponse(questionPacket, decision.RequestName, vpnPacket.Payload[0], vpnPacket.Payload[6:10])
+			return s.buildSessionBusyResponse(questionPacket, decision.RequestName, core[0], core[6:10])
 		}
+
 		return nil
 	}
+
 	if record == nil {
 		return nil
 	}
+
 	record.streamCleanup = s.cleanupStreamArtifacts
 
 	if !reused && s.log != nil {

@@ -25,7 +25,7 @@ func TestNextSessionInitAttemptUsesBalancerSnapshotConnection(t *testing.T) {
 	originalDomain := connections[0].Domain
 	connections[0].Domain = "mutated.example.com"
 
-	conn, _, _, err := c.nextSessionInitAttempt()
+	conn, _, _, _, err := c.nextSessionInitAttempt()
 	if err != nil {
 		t.Fatalf("nextSessionInitAttempt returned error: %v", err)
 	}
@@ -58,8 +58,7 @@ func TestApplySessionInitPacketAppliesServerClientPolicy(t *testing.T) {
 	c.syncedDownloadMTU = 5000
 
 	verifyCode := [4]byte{1, 2, 3, 4}
-	initPayload := make([]byte, sessionInitPayloadSize)
-	initPayload[0] = 1
+	const responseMode = uint8(1) // mtuProbeBase64Reply
 
 	var payload [VpnProto.SessionAcceptPayloadSize]byte
 	payload[0] = 7
@@ -84,7 +83,7 @@ func TestApplySessionInitPacketAppliesServerClientPolicy(t *testing.T) {
 	err := c.applySessionInitPacket(VpnProto.Packet{
 		PacketType: Enums.PACKET_SESSION_ACCEPT,
 		Payload:    payload[:],
-	}, initPayload, verifyCode)
+	}, responseMode, verifyCode)
 	if err != nil {
 		t.Fatalf("applySessionInitPacket returned error: %v", err)
 	}
@@ -163,7 +162,6 @@ func TestApplySessionInitPacketAppliesServerClientPolicy(t *testing.T) {
 func TestApplySessionInitPacketAcceptsLegacySessionAcceptPayload(t *testing.T) {
 	c := buildTestClientWithResolvers(config.ClientConfig{}, "a")
 	verifyCode := [4]byte{4, 3, 2, 1}
-	initPayload := make([]byte, sessionInitPayloadSize)
 
 	payload := make([]byte, VpnProto.SessionAcceptBasePayloadSize)
 	payload[0] = 3
@@ -174,7 +172,7 @@ func TestApplySessionInitPacketAcceptsLegacySessionAcceptPayload(t *testing.T) {
 	err := c.applySessionInitPacket(VpnProto.Packet{
 		PacketType: Enums.PACKET_SESSION_ACCEPT,
 		Payload:    payload,
-	}, initPayload, verifyCode)
+	}, 0, verifyCode)
 	if err != nil {
 		t.Fatalf("legacy session accept should still work, got error: %v", err)
 	}
@@ -232,10 +230,7 @@ func TestApplySessionInitPacketPreservesHigherTunnelProcessWorkers(t *testing.T)
 		Payload:    payload[:],
 	}
 
-	initPayload := make([]byte, sessionInitPayloadSize)
-	initPayload[0] = 1
-
-	if err := c.applySessionInitPacket(packet, initPayload, verifyCode); err != nil {
+	if err := c.applySessionInitPacket(packet, mtuProbeBase64Reply, verifyCode); err != nil {
 		t.Fatalf("applySessionInitPacket returned error: %v", err)
 	}
 
