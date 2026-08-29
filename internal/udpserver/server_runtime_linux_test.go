@@ -53,7 +53,7 @@ func TestDefaultUDPListenerIsDualStack(t *testing.T) {
 		UDPReaders:       1,
 		SocketBufferSize: 64 * 1024,
 	}, logger.New("Dual Stack UDP Test", "ERROR"), nil)
-	conns, err := server.openUDPListeners()
+	conns, err := server.openUDPListeners(1)
 	if err != nil {
 		t.Fatalf("openUDPListeners failed: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestExplicitIPv6WildcardUsesIPv6Socket(t *testing.T) {
 		UDPReaders:       1,
 		SocketBufferSize: 64 * 1024,
 	}, logger.New("IPv6 Wildcard UDP Test", "ERROR"), nil)
-	conns, err := server.openUDPListeners()
+	conns, err := server.openUDPListeners(1)
 	if err != nil {
 		t.Fatalf("openUDPListeners failed: %v", err)
 	}
